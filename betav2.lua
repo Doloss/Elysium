@@ -4,18 +4,17 @@
     Built by Owner / AlphA
 
     Features:
-        Reach    — firetouchinterest on swordHitbox-* Part, gated by filters
-        AutoAim  — capped angular velocity lock-on, forward-cone selection
-        AutoJump — StateChanged -> Jumping sync on closest opponent (confirmed working)
+        Reach    — firetouchinterest on swordHitbox-* Part, weighted 3D distance
+        AutoAim  — Heartbeat camera yaw slerp, 120° forward cone
+        AutoJump — Y-velocity spike on tracked target HRP
 
-    Protection:
-        - No hookfunction / trampolines
-        - All reach-loop work pcall-wrapped
-        - Single global env table (getgenv().elysium)
-        - FTI call-site isolated in one function
+    v1.2:
+        - Y-weighted distance (0.4) for Reach + AutoAim
+        - AutoAim on Heartbeat, camera CFrame rotation
+        - AutoJump rewritten: velocity spike detector, no StateChanged
 
     Debug:
-        getgenv().elysium.debug = true   -- enable [AJ]/[AA]/[R] logs
+        getgenv().elysium.debug = true
 --]]
 
 -- ================================================================
@@ -52,12 +51,12 @@ end
 local Players    = game:GetService("Players")
 local UIS        = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local workspaceRef = workspace
 
 local lp = Players.LocalPlayer
-
 local HAS_FTI = (type(firetouchinterest) == "function")
 if not HAS_FTI then
-    warn("[Elysium] firetouchinterest not available on this executor — Reach disabled.")
+    warn("[Elysium] firetouchinterest not available — Reach disabled.")
 end
 
 local ENV = getgenv and getgenv() or _G
@@ -65,7 +64,7 @@ ENV.elysium = ENV.elysium or {}
 local state = ENV.elysium
 
 -- ================================================================
--- CONFIG DEFAULTS
+-- CONFIG
 -- ================================================================
 state.reachOn             = false
 state.reachDist           = 10
@@ -77,6 +76,7 @@ state.ignoreForceField    = false
 state.tabCheck            = false
 state.lastSwingAt         = 0
 state.SWING_DEBOUNCE      = 0.05
+state.distYWeight         = 0.4
 
 state.autoAimOn           = false
 state.autoAimDelayMs      = 0
@@ -90,6 +90,7 @@ state.autoJumpOn          = false
 state.autoJumpTeamCheck   = false
 state.autoJumpDelayMs     = 0
 state.autoJumpDistance    = 15
+state.jumpVelocityThreshold = 67
 state.jumpDetectCooldown  = 0.15
 
 state.debug               = state.debug or false
@@ -100,20 +101,18 @@ local function dbg(tag, msg)
 end
 
 -- ================================================================
--- FOCUS / TAB CHECK
+-- FOCUS / TAB
 -- ================================================================
 local FOCUS_API_OK = false
 do
     local ok, res = pcall(function() return typeof(UIS.IsWindowFocused) end)
     FOCUS_API_OK = ok and res == "function"
 end
-
 state.focused = true
 if not FOCUS_API_OK then
     pcall(function() UIS.WindowFocused:Connect(function() state.focused = true end) end)
     pcall(function() UIS.WindowFocusReleased:Connect(function() state.focused = false end) end)
 end
-
 local function tabCheckPasses()
     if not state.tabCheck then return true end
     if FOCUS_API_OK then
@@ -125,7 +124,7 @@ local function tabCheckPasses()
 end
 
 -- ================================================================
--- SHARED HELPERS
+-- HELPERS
 -- ================================================================
 local function getMyChar()     return lp.Character end
 local function getMyHRP()
@@ -142,9 +141,22 @@ local function humOf(char)
     if not char then return nil end
     return char:FindFirstChildOfClass("Humanoid")
 end
+
+-- flat XZ distance — used for AutoJump target *selection*
 local function xzDist(a, b)
     local dx, dz = a.X - b.X, a.Z - b.Z
     return math.sqrt(dx*dx + dz*dz)
+end
+
+-- weighted 3D distance — Y contributes at yWeight (0.4 default)
+-- used for Reach + AutoAim distance filters
+local function weightedDist(a, b, yWeight)
+    yWeight = yWeight or state.distYWeight or 0.4
+    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
+    local flat = math.sqrt(dx*dx + dz*dz)
+    local vert = math.abs(dy)
+    local vy = vert * yWeight
+    return math.sqrt(flat*flat + vy*vy)
 end
 
 local function isValidTarget(player, opts)
@@ -215,15 +227,13 @@ end
 local function fireTouchOnChar(hitbox, enemyChar)
     if state.ftiAllParts then
         for _, part in ipairs(enemyChar:GetDescendants()) do
-            if part:IsA("BasePart") then
-                pcall(fireTouchOrdered, hitbox, part)
-            end
+            if part:IsA("BasePart") then pcall(fireTouchOrdered, hitbox, part) end
         end
     else
-        local hrp = hrpOf(enemyChar)
-               or enemyChar:FindFirstChild("UpperTorso")
-               or enemyChar:FindFirstChild("Torso")
-        if hrp then pcall(fireTouchOrdered, hitbox, hrp) end
+        local target = hrpOf(enemyChar)
+                    or enemyChar:FindFirstChild("UpperTorso")
+                    or enemyChar:FindFirstChild("Torso")
+        if target then pcall(fireTouchOrdered, hitbox, target) end
     end
 end
 
@@ -249,7 +259,7 @@ local function executeReach()
         if isValidTarget(player) then
             local echar = player.Character
             local ehRP  = hrpOf(echar)
-            if echar and ehRP and xzDist(myHRP.Position, ehRP.Position) <= dist then
+            if echar and ehRP and weightedDist(myHRP.Position, ehRP.Position) <= dist then
                 fireTouchOnChar(hitbox, echar)
                 if amp > 0 then
                     for i = 1, amp do
@@ -299,11 +309,11 @@ end)
 if lp.Character then watchCharacter(lp.Character) end
 
 -- ================================================================
--- AUTO AIM
+-- AUTO AIM  (Heartbeat, camera CFrame yaw)
 -- ================================================================
-local aimRenderConn = nil
+local aimBeatConn  = nil
 local aimTargetChar = nil
-local aimSeenAt     = 0
+local aimSeenAt    = 0
 
 local function pickAimTarget()
     local myHRP = getMyHRP()
@@ -316,9 +326,8 @@ local function pickAimTarget()
             local echar = player.Character
             local ehRP  = hrpOf(echar)
             if ehRP then
-                local d = xzDist(myHRP.Position, ehRP.Position)
-                if d <= limit
-                and inForwardCone(myHRP, ehRP.Position, state.autoAimFOV) then
+                local d = weightedDist(myHRP.Position, ehRP.Position)
+                if d <= limit and inForwardCone(myHRP, ehRP.Position, state.autoAimFOV) then
                     if d < bestD then bestD, best = d, echar end
                 end
             end
@@ -332,7 +341,7 @@ local function shiftLockActive()
 end
 
 local function stopAutoAim()
-    if aimRenderConn then aimRenderConn:Disconnect(); aimRenderConn = nil end
+    if aimBeatConn then aimBeatConn:Disconnect(); aimBeatConn = nil end
     aimTargetChar = nil
 end
 
@@ -343,6 +352,9 @@ local function stepAutoAim(dt)
     local hum = getMyHumanoid()
     if not hum or hum.Health <= 0 then stopAutoAim(); return end
     if shiftLockActive() then stopAutoAim(); return end
+
+    local cam = workspaceRef.CurrentCamera
+    if not cam then return end
 
     local target = pickAimTarget()
     if target ~= aimTargetChar then
@@ -368,15 +380,16 @@ local function stepAutoAim(dt)
         )
     end
 
-    local dir = to - myHRP.Position
-    if dir.Magnitude < 0.01 then return end
-    dir = dir.Unit
+    local dir = to - cam.CFrame.Position
+    local flatDir = Vector3.new(dir.X, 0, dir.Z)
+    if flatDir.Magnitude < 0.01 then return end
+    flatDir = flatDir.Unit
 
     local maxDeltaRad = math.rad(state.autoAimMaxDegPerSec) * dt
 
-    local currentLook = myHRP.CFrame.LookVector
-    local currentYaw  = math.atan2(currentLook.X, currentLook.Z)
-    local desiredYaw  = math.atan2(dir.X, dir.Z)
+    local camLook = cam.CFrame.LookVector
+    local currentYaw = math.atan2(camLook.X, camLook.Z)
+    local desiredYaw = math.atan2(flatDir.X, flatDir.Z)
 
     local delta = desiredYaw - currentYaw
     while delta >  math.pi do delta = delta - 2*math.pi end
@@ -384,31 +397,37 @@ local function stepAutoAim(dt)
 
     local newYaw = currentYaw + math.clamp(delta, -maxDeltaRad, maxDeltaRad)
 
-    local newCF = CFrame.new(myHRP.Position) * CFrame.Angles(0, newYaw, 0)
-    if myHRP.Parent then
-        myHRP.CFrame = newCF
-    end
+    -- preserve current pitch, only change yaw
+    local pitch = math.asin(math.clamp(camLook.Y, -1, 1))
+    local newLook = Vector3.new(
+        math.sin(newYaw) * math.cos(pitch),
+        math.sin(pitch),
+        math.cos(newYaw) * math.cos(pitch)
+    )
+    cam.CFrame = CFrame.new(cam.CFrame.Position, cam.CFrame.Position + newLook)
 end
 
 local function startAutoAim()
-    if aimRenderConn then return end
-    aimRenderConn = RunService.RenderStepped:Connect(function(dt)
+    if aimBeatConn then return end
+    aimBeatConn = RunService.Heartbeat:Connect(function(dt)
         pcall(stepAutoAim, dt)
     end)
 end
 
 -- ================================================================
--- AUTO JUMP
+-- AUTO JUMP  (velocity spike detector)
 -- ================================================================
-local jmp_heartbeat  = nil
-local jmp_stateConn  = nil
-local jmp_currentHum = nil
-local jmp_tick       = 0
-local jmp_lastFired  = 0
+local jmp_beatConn     = nil
+local jmp_scanConn     = nil
+local jmp_currentHum   = nil
+local jmp_currentHRP   = nil
+local jmp_prevAirborne = false
+local jmp_tick         = 0
+local jmp_lastFired    = 0
 
 local function closestEnemyHumanoid()
     local myHRP = getMyHRP()
-    if not myHRP then dbg("AJ", "no myHRP"); return nil end
+    if not myHRP then return nil end
     local limit = tonumber(state.autoJumpDistance) or 15
     local best, bestD = nil, math.huge
 
@@ -423,25 +442,20 @@ local function closestEnemyHumanoid()
             end
         end
     end
-    dbg("AJ", ("scan -> %s (teamCheck=%s)"):format(tostring(best ~= nil), tostring(state.autoJumpTeamCheck)))
     return best
 end
 
-local function doJumpWithDelay(firedByHum, reason)
+local function doJump(reason)
     if not state.autoJumpOn then return end
-    if firedByHum and firedByHum ~= jmp_currentHum then
-        dbg("AJ", "doJump ignored — stale target")
-        return
-    end
-    if not tabCheckPasses() then dbg("AJ", "doJump blocked — tabCheck"); return end
+    if not tabCheckPasses() then return end
 
     local now = os.clock()
     if now - jmp_lastFired < state.jumpDetectCooldown then
-        dbg("AJ", ("doJump cooldown %.3fs"):format(now - jmp_lastFired))
+        dbg("AJ", ("cooldown %.3fs"):format(now - jmp_lastFired))
         return
     end
     jmp_lastFired = now
-    dbg("AJ", "doJump FIRED reason=" .. tostring(reason))
+    dbg("AJ", "fire reason=" .. reason)
 
     local delayMs = tonumber(state.autoJumpDelayMs) or 0
     local function jump()
@@ -455,7 +469,7 @@ local function doJumpWithDelay(firedByHum, reason)
         or s == Enum.HumanoidStateType.RunningNoPhysics then
             hum.Jump = true
         else
-            dbg("AJ", "jump rejected, my state=" .. tostring(s))
+            dbg("AJ", "rejected my state=" .. tostring(s))
         end
     end
 
@@ -467,25 +481,17 @@ local function doJumpWithDelay(firedByHum, reason)
 end
 
 local function hookJumpTarget(hum)
-    if jmp_stateConn then jmp_stateConn:Disconnect(); jmp_stateConn = nil end
     jmp_currentHum = hum
-    if not hum then dbg("AJ", "hookJumpTarget: nil"); return end
-    dbg("AJ", "hookJumpTarget: " .. (hum.Parent and hum.Parent.Name or "?"))
-    if not hrpOf(hum.Parent) then return end
-
-    jmp_stateConn = hum.StateChanged:Connect(function(_, newState)
-        if not state.autoJumpOn then return end
-        if hum ~= jmp_currentHum then return end
-        if newState == Enum.HumanoidStateType.Jumping then
-            doJumpWithDelay(hum, "StateChanged")
-        end
-    end)
+    jmp_currentHRP = hum and hum.Parent and hrpOf(hum.Parent) or nil
+    jmp_prevAirborne = false
+    dbg("AJ", "hookJumpTarget " .. (hum and (hum.Parent and hum.Parent.Name or "?") or "nil"))
 end
 
 local function startAutoJump()
-    if jmp_heartbeat then return end
-    dbg("AJ", "startAutoJump")
-    jmp_heartbeat = RunService.Heartbeat:Connect(function(dt)
+    if jmp_beatConn then return end
+
+    -- 10 Hz target scan
+    jmp_scanConn = RunService.Heartbeat:Connect(function(dt)
         if not state.autoJumpOn then return end
         jmp_tick = jmp_tick + dt
         if jmp_tick < 0.1 then return end
@@ -499,32 +505,45 @@ local function startAutoJump()
             hookJumpTarget(nil)
         end
     end)
+
+    -- per-frame velocity check on the tracked target
+    jmp_beatConn = RunService.Heartbeat:Connect(function()
+        if not state.autoJumpOn then return end
+        if not jmp_currentHum or not jmp_currentHRP then return end
+        if not jmp_currentHum.Parent or not jmp_currentHRP.Parent then return end
+
+        local v = jmp_currentHRP.AssemblyLinearVelocity
+        local airborne = (jmp_currentHum.FloorMaterial == Enum.Material.Air)
+
+        if airborne
+        and not jmp_prevAirborne
+        and v.Y > (tonumber(state.jumpVelocityThreshold) or 67) then
+            doJump(("velocity Y=%.1f"):format(v.Y))
+        end
+        jmp_prevAirborne = airborne
+    end)
 end
 
 local function stopAutoJump()
-    if jmp_heartbeat then jmp_heartbeat:Disconnect(); jmp_heartbeat = nil end
-    if jmp_stateConn then jmp_stateConn:Disconnect(); jmp_stateConn = nil end
-    jmp_currentHum = nil
-    jmp_tick       = 0
+    if jmp_beatConn then jmp_beatConn:Disconnect(); jmp_beatConn = nil end
+    if jmp_scanConn then jmp_scanConn:Disconnect(); jmp_scanConn = nil end
+    jmp_currentHum   = nil
+    jmp_currentHRP   = nil
+    jmp_prevAirborne = false
+    jmp_tick         = 0
 end
 
 -- ================================================================
 -- WINDOW
 -- ================================================================
 local Window = WindUI:CreateWindow({
-    Title         = "Elysium  |  Custom Duels",
-    Folder        = "elysium",
-    Icon          = "sword",
-    NewElements   = true,
-    HideSearchBar = false,
+    Title = "Elysium  |  Custom Duels",
+    Folder = "elysium", Icon = "sword",
+    NewElements = true, HideSearchBar = false,
     OpenButton = {
-        Title = "Elysium",
-        CornerRadius = UDim.new(1, 0),
-        StrokeThickness = 2,
-        Enabled = true,
-        Draggable = true,
-        OnlyMobile = false,
-        Scale = 0.5,
+        Title = "Elysium", CornerRadius = UDim.new(1, 0),
+        StrokeThickness = 2, Enabled = true, Draggable = true,
+        OnlyMobile = false, Scale = 0.5,
         Color = ColorSequence.new(
             Color3.fromHex("#c0392b"),
             Color3.fromHex("#8e1a0e")
@@ -533,11 +552,10 @@ local Window = WindUI:CreateWindow({
     Topbar = { Height = 44, ButtonsType = "Mac" },
 })
 
-Window:Tag({ Title = "v1.1", Color = Color3.fromHex("#1c1c1c"), Border = true })
+Window:Tag({ Title = "v1.2", Color = Color3.fromHex("#1c1c1c"), Border = true })
 
 local Red    = Color3.fromHex("#e74c3c")
 local Orange = Color3.fromHex("#e67e22")
-local Green  = Color3.fromHex("#2ecc71")
 local Blue   = Color3.fromHex("#3498db")
 
 local CombatSection   = Window:Section({ Title = "Combat" })
@@ -550,77 +568,55 @@ do
     local ReachTab = CombatSection:Tab({
         Title = "Reach", Icon = "sword", IconColor = Red, Border = true,
     })
-
     ReachTab:Toggle({
         Title = "Sword Reach",
-        Desc  = "FireTouchInterest on swordHitbox against enemies within distance.",
+        Desc = "FireTouchInterest on swordHitbox within weighted distance.",
         Value = false,
         Callback = function(v)
             if v and not HAS_FTI then
-                WindUI:Notify({
-                    Title = "Reach unavailable",
-                    Content = "firetouchinterest is not present on this executor.",
-                    Icon = "alert-triangle", Duration = 5,
-                })
+                WindUI:Notify({ Title = "Reach unavailable",
+                    Content = "firetouchinterest not present on this executor.",
+                    Icon = "alert-triangle", Duration = 5 })
                 return
             end
             state.reachOn = v
         end,
     })
-
     ReachTab:Space()
     ReachTab:Slider({
         Title = "Reach Distance",
-        Desc  = "Horizontal stud distance — how far the hitbox fires.",
+        Desc = "Weighted 3D distance (Y at 40%).",
         Step = 1, Value = { Min = 1, Max = 20, Default = 10 },
         Callback = function(v) state.reachDist = v end,
     })
-
     ReachTab:Space()
     ReachTab:Slider({
         Title = "Damage Amplifier",
-        Desc  = "Jittered extra FTI fires per target per swing (0 = off, 17 = max).",
+        Desc = "Jittered extra FTI fires per target per swing.",
         Step = 1, Value = { Min = 0, Max = 17, Default = 0 },
         Callback = function(v) state.damageAmp = v end,
     })
-
     ReachTab:Space()
     ReachTab:Section({ Title = "Filters", Box = true, BoxBorder = true, Opened = true })
-
-    ReachTab:Toggle({
-        Title = "Invisible Check",
-        Desc  = "Skip players with HRP transparency ≥ 0.9.",
-        Value = false,
-        Callback = function(v) state.invisCheck = v end,
-    })
+    ReachTab:Toggle({ Title = "Invisible Check",
+        Desc = "Skip players with HRP transparency ≥ 0.9.",
+        Value = false, Callback = function(v) state.invisCheck = v end })
     ReachTab:Space()
-    ReachTab:Toggle({
-        Title = "FTI All Parts",
-        Desc  = "Fire touch on every body part (louder footprint).",
-        Value = false,
-        Callback = function(v) state.ftiAllParts = v end,
-    })
+    ReachTab:Toggle({ Title = "FTI All Parts",
+        Desc = "Fire touch on every body part.",
+        Value = false, Callback = function(v) state.ftiAllParts = v end })
     ReachTab:Space()
-    ReachTab:Toggle({
-        Title = "Reach on Lunge Only",
-        Desc  = "Only fire when local HRP velocity spike detects a lunge.",
-        Value = false,
-        Callback = function(v) state.ftiLungeOnly = v end,
-    })
+    ReachTab:Toggle({ Title = "Reach on Lunge Only",
+        Desc = "Only fire on velocity-spike lunges.",
+        Value = false, Callback = function(v) state.ftiLungeOnly = v end })
     ReachTab:Space()
-    ReachTab:Toggle({
-        Title = "Ignore ForceFielded Players",
-        Desc  = "Skip players with an active ForceField.",
-        Value = false,
-        Callback = function(v) state.ignoreForceField = v end,
-    })
+    ReachTab:Toggle({ Title = "Ignore ForceFielded Players",
+        Desc = "Skip players with active ForceField.",
+        Value = false, Callback = function(v) state.ignoreForceField = v end })
     ReachTab:Space()
-    ReachTab:Toggle({
-        Title = "Tab Check",
-        Desc  = "Only fire when the Roblox window is focused. Gates ALL features.",
-        Value = false,
-        Callback = function(v) state.tabCheck = v end,
-    })
+    ReachTab:Toggle({ Title = "Tab Check",
+        Desc = "Only fire when window is focused. Gates ALL features.",
+        Value = false, Callback = function(v) state.tabCheck = v end })
 end
 
 -- ================================================================
@@ -630,10 +626,9 @@ do
     local AutoAimTab = CombatSection:Tab({
         Title = "Auto Aim", Icon = "crosshair", IconColor = Orange, Border = true,
     })
-
     AutoAimTab:Toggle({
         Title = "Auto Aim",
-        Desc  = "Locks HRP onto the closest target in a 120° forward cone.",
+        Desc = "Rotates camera toward closest target in forward cone.",
         Value = false,
         Callback = function(v)
             state.autoAimOn = v
@@ -643,35 +638,32 @@ do
     AutoAimTab:Space()
     AutoAimTab:Slider({
         Title = "Auto Aim Delay",
-        Desc  = "Delay (ms) after acquiring a target before the lock engages.",
+        Desc = "Delay (ms) after acquisition before lock engages.",
         Step = 10, Value = { Min = 0, Max = 500, Default = 0 },
         Callback = function(v) state.autoAimDelayMs = v end,
     })
     AutoAimTab:Space()
     AutoAimTab:Slider({
         Title = "Auto Aim Distance",
-        Desc  = "Max horizontal stud distance (1–13).",
+        Desc = "Weighted 3D distance (Y at 40%).",
         Step = 1, Value = { Min = 1, Max = 13, Default = 6 },
         Callback = function(v) state.autoAimDistance = v end,
     })
     AutoAimTab:Space()
     AutoAimTab:Section({ Title = "Jitter", Box = true, BoxBorder = true, Opened = true })
-    AutoAimTab:Toggle({
-        Title = "Auto Aim Jitter",
-        Desc  = "Adds random aim offset to humanize lock-on.",
-        Value = false,
-        Callback = function(v) state.autoAimJitter = v end,
-    })
+    AutoAimTab:Toggle({ Title = "Auto Aim Jitter",
+        Desc = "Adds random offset to humanize.",
+        Value = false, Callback = function(v) state.autoAimJitter = v end })
     AutoAimTab:Space()
     AutoAimTab:Slider({
         Title = "Jitter Amount",
-        Desc  = "Max offset magnitude (thousandths of a stud).",
+        Desc = "Max offset (thousandths of a stud).",
         Step = 1, Value = { Min = 0, Max = 20, Default = 5 },
         Callback = function(v) state.autoAimJitterAmt = v end,
     })
     AutoAimTab:Space()
     AutoAimTab:Section({
-        Title = "HRP yaw capped at 240°/s. Disables on shift-lock or death.",
+        Title = "Camera yaw capped at 240°/s. Disables on shift-lock or death.",
         TextSize = 14, TextTransparency = 0.45,
     })
 end
@@ -683,10 +675,9 @@ do
     local AutoJumpTab = MovementSection:Tab({
         Title = "Auto Jump", Icon = "arrow-up", IconColor = Blue, Border = true,
     })
-
     AutoJumpTab:Toggle({
         Title = "Auto Jump",
-        Desc  = "Jumps when the closest opponent jumps (StateChanged).",
+        Desc = "Jumps when the tracked opponent's Y-velocity spikes.",
         Value = false,
         Callback = function(v)
             state.autoJumpOn = v
@@ -696,23 +687,29 @@ do
     AutoJumpTab:Space()
     AutoJumpTab:Toggle({
         Title = "Team Check",
-        Desc  = "Skip teammates (see ELYSIUM.isTeammate hook — currently a stub).",
-        Value = false,
-        Callback = function(v) state.autoJumpTeamCheck = v end,
+        Desc = "Skip teammates (ELYSIUM.isTeammate — stub).",
+        Value = false, Callback = function(v) state.autoJumpTeamCheck = v end,
     })
     AutoJumpTab:Space()
     AutoJumpTab:Slider({
         Title = "Auto Jump Delay",
-        Desc  = "Delay (ms) after opponent jump detected.",
+        Desc = "Delay (ms) after velocity detection.",
         Step = 10, Value = { Min = 0, Max = 500, Default = 0 },
         Callback = function(v) state.autoJumpDelayMs = v end,
     })
     AutoJumpTab:Space()
     AutoJumpTab:Slider({
         Title = "Auto Jump Distance",
-        Desc  = "Max horizontal stud range to detect opponent jumps.",
+        Desc = "Max horizontal stud range to track target.",
         Step = 1, Value = { Min = 1, Max = 50, Default = 15 },
         Callback = function(v) state.autoJumpDistance = v end,
+    })
+    AutoJumpTab:Space()
+    AutoJumpTab:Slider({
+        Title = "Jump Velocity Threshold",
+        Desc = "Y-velocity (studs/s) required to trigger. Stock JumpPower=50 → ~55-60.",
+        Step = 1, Value = { Min = 20, Max = 115, Default = 67 },
+        Callback = function(v) state.jumpVelocityThreshold = v end,
     })
 end
 
@@ -721,7 +718,7 @@ end
 -- ================================================================
 WindUI:Notify({
     Title = "Elysium loaded",
-    Content = "v1.1 — Reach + AutoAim + AutoJump. TabCheck gates all."
-        .. (HAS_FTI and "" or " (Reach disabled — no FTI)"),
+    Content = "v1.2 — weighted distance, Heartbeat AutoAim, velocity AutoJump."
+        .. (HAS_FTI and "" or " (Reach disabled)"),
     Icon = "check", Duration = 4,
 })
